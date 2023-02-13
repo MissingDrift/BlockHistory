@@ -1,0 +1,302 @@
+package me.missingdrift.blockhistory.listeners;
+
+import me.missingdrift.blockhistory.Actor;
+import me.missingdrift.blockhistory.blockhistory;
+import me.missingdrift.blockhistory.Logging;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.DoubleChest;
+import org.bukkit.entity.HumanEntity;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.inventory.ClickType;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import static me.missingdrift.blockhistory.config.Config.isLogging;
+import static me.missingdrift.blockhistory.util.BukkitUtils.*;
+
+public class ChestAccessLogging extends LoggingListener {
+    private class PlayerActiveInventoryModifications {
+        private final HumanEntity actor;
+        private final Location location;
+        private final HashMap<ItemStack, Integer> modifications;
+
+        public PlayerActiveInventoryModifications(HumanEntity actor, Location location) {
+            this.actor = actor;
+            this.location = location;
+            this.modifications = new HashMap<>();
+        }
+
+        public void addModification(ItemStack stack, int amount) {
+            if (amount == 0) {
+                return;
+            }
+
+            ArrayList<PlayerActiveInventoryModifications> allViewers = containersByLocation.get(location);
+            if (allViewers.size() > 1) {
+                for (PlayerActiveInventoryModifications other : allViewers) {
+                    if (other != this) {
+                        other.flush();
+                    }
+                }
+            }
+
+
+            stack = new ItemStack(stack);
+            stack.setAmount(1);
+            Integer existing = modifications.get(stack);
+            int newTotal = amount + (existing == null ? 0 : existing);
+            if (newTotal == 0) {
+                modifications.remove(stack);
+            } else {
+                modifications.put(stack, newTotal);
+            }
+        }
+
+        public void flush() {
+            if (!modifications.isEmpty()) {
+                for (Entry<ItemStack, Integer> e : modifications.entrySet()) {
+                    ItemStack stack = e.getKey();
+                    int amount = e.getValue();
+                    stack.setAmount(Math.abs(amount));
+
+                    consumer.queueChestAccess(Actor.actorFromEntity(actor), location, location.getWorld().getBlockAt(location).getBlockData(), stack, amount < 0);
+                }
+                modifications.clear();
+            }
+        }
+
+        public HumanEntity getActor() {
+            return actor;
+        }
+
+        public Location getLocation() {
+            return location;
+        }
+    }
+
+    private final Map<HumanEntity, PlayerActiveInventoryModifications> containersByOwner = new HashMap<>();
+    private final Map<Location, ArrayList<PlayerActiveInventoryModifications>> containersByLocation = new HashMap<>();
+
+    public ChestAccessLogging(blockhistory lb) {
+        super(lb);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onInventoryClose(InventoryCloseEvent event) {
+        final HumanEntity player = event.getPlayer();
+        if (!isLogging(player.getWorld(), Logging.CHESTACCESS)) {
+            return;
+        }
+        InventoryHolder holder = event.getInventory().getHolder();
+        if (holder instanceof BlockState || holder instanceof DoubleChest) {
+            final PlayerActiveInventoryModifications modifications = containersByOwner.remove(player);
+            if (modifications != null) {
+                final Location loc = modifications.getLocation();
+                ArrayList<PlayerActiveInventoryModifications> atLocation = containersByLocation.get(loc);
+                atLocation.remove(modifications);
+                if (atLocation.isEmpty()) {
+                    containersByLocation.remove(loc);
+                }
+                modifications.flush();
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        final HumanEntity player = event.getPlayer();
+        if (!isLogging(player.getWorld(), Logging.CHESTACCESS)) {
+            return;
+        }
+        if (event.getInventory() != null) {
+            InventoryHolder holder = event.getInventory().getHolder();
+            if (holder instanceof BlockState || holder instanceof DoubleChest) {
+                if (getInventoryHolderType(holder) != Material.CRAFTING_TABLE) {
+                    PlayerActiveInventoryModifications modifications = new PlayerActiveInventoryModifications(event.getPlayer(), getInventoryHolderLocation(holder));
+                    containersByOwner.put(modifications.getActor(), modifications);
+                    containersByLocation.compute(modifications.getLocation(), (k, v) -> {
+                        if (v == null) {
+                            v = new ArrayList<>();
+                        }
+                        v.add(modifications);
+                        return v;
+                    });
+                }
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onInventoryClick(InventoryClickEvent event) {
+        final HumanEntity player = event.getWhoClicked();
+        if (!isLogging(player.getWorld(), Logging.CHESTACCESS)) {
+            return;
+        }
+        InventoryHolder holder = event.getInventory().getHolder();
+        if (holder instanceof BlockState || holder instanceof DoubleChest) {
+            final PlayerActiveInventoryModifications modifications = containersByOwner.get(player);
+            if (modifications != null) {
+                switch (event.getAction()) {
+                    case PICKUP_ONE:
+                    case DROP_ONE_SLOT:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCurrentItem(), -1);
+                        }
+                        break;
+                    case PICKUP_HALF:
+
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCurrentItem(), -(event.getCurrentItem().getAmount() + 1) / 2);
+                        }
+                        break;
+                    case PICKUP_SOME:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            int taken = event.getCurrentItem().getAmount() - event.getCurrentItem().getMaxStackSize();
+                            modifications.addModification(event.getCursor(), -taken);
+                        }
+                        break;
+                    case PICKUP_ALL:
+                    case DROP_ALL_SLOT:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCurrentItem(), -event.getCurrentItem().getAmount());
+                        }
+                        break;
+                    case PLACE_ONE:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCursor(), 1);
+                        }
+                        break;
+                    case PLACE_SOME:
+
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            int placeable = event.getCurrentItem().getMaxStackSize() - event.getCurrentItem().getAmount();
+                            modifications.addModification(event.getCursor(), placeable);
+                        }
+                        break;
+                    case PLACE_ALL:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCursor(), event.getCursor().getAmount());
+                        }
+                        break;
+                    case SWAP_WITH_CURSOR:
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            modifications.addModification(event.getCursor(), event.getCursor().getAmount());
+                            modifications.addModification(event.getCurrentItem(), -event.getCurrentItem().getAmount());
+                        }
+                        break;
+                    case MOVE_TO_OTHER_INVENTORY:
+                        boolean removed = event.getRawSlot() < event.getView().getTopInventory().getSize();
+                        modifications.addModification(event.getCurrentItem(), event.getCurrentItem().getAmount() * (removed ? -1 : 1));
+                        break;
+                    case COLLECT_TO_CURSOR:
+
+                        ItemStack cursor = event.getCursor();
+                        if (cursor == null) {
+                            return;
+                        }
+                        int toPickUp = cursor.getMaxStackSize() - cursor.getAmount();
+                        int takenFromContainer = 0;
+                        boolean takeFromFullStacks = false;
+                        Inventory top = event.getView().getTopInventory();
+                        Inventory bottom = event.getView().getBottomInventory();
+                        while (toPickUp > 0) {
+                            for (ItemStack stack : top.getStorageContents()) {
+                                if (cursor.isSimilar(stack)) {
+                                    if (takeFromFullStacks == (stack.getAmount() == stack.getMaxStackSize())) {
+                                        int take = Math.min(toPickUp, stack.getAmount());
+                                        toPickUp -= take;
+                                        takenFromContainer += take;
+                                        if (toPickUp <= 0) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (toPickUp <= 0) {
+                                break;
+                            }
+                            for (ItemStack stack : bottom.getStorageContents()) {
+                                if (cursor.isSimilar(stack)) {
+                                    if (takeFromFullStacks == (stack.getAmount() == stack.getMaxStackSize())) {
+                                        int take = Math.min(toPickUp, stack.getAmount());
+                                        toPickUp -= take;
+                                        if (toPickUp <= 0) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (takeFromFullStacks) {
+                                break;
+                            } else {
+                                takeFromFullStacks = true;
+                            }
+                        }
+                        if (takenFromContainer > 0) {
+                            modifications.addModification(event.getCursor(), -takenFromContainer);
+                        }
+                        break;
+                    case HOTBAR_SWAP: // number key or offhand key
+                    case HOTBAR_MOVE_AND_READD: // something was in the other slot
+                        if (event.getRawSlot() < event.getView().getTopInventory().getSize()) {
+                            ItemStack otherSlot = (event.getClick() == ClickType.SWAP_OFFHAND) ? event.getWhoClicked().getInventory().getItemInOffHand() : event.getWhoClicked().getInventory().getItem(event.getHotbarButton());
+                            if (event.getCurrentItem() != null && event.getCurrentItem().getType() != Material.AIR) {
+                                modifications.addModification(event.getCurrentItem(), -event.getCurrentItem().getAmount());
+                            }
+                            if (otherSlot != null && otherSlot.getType() != Material.AIR) {
+                                modifications.addModification(otherSlot, otherSlot.getAmount());
+                            }
+                        }
+                        break;
+                    case DROP_ALL_CURSOR:
+                    case DROP_ONE_CURSOR:
+                    case CLONE_STACK:
+                    case NOTHING:
+                        // only the cursor or nothing (but not the inventory) was modified
+                        break;
+                    case UNKNOWN:
+                    default:
+                        // unable to log something we don't know
+                        consumer.getblockhistory().getLogger().warning("Unknown inventory action by " + event.getWhoClicked().getName() + ": " + event.getAction() + " Slot: " + event.getSlot() + " Slot type: " + event.getSlotType());
+                        break;
+                }
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onInventoryDrag(InventoryDragEvent event) {
+        final HumanEntity player = event.getWhoClicked();
+        if (!isLogging(player.getWorld(), Logging.CHESTACCESS)) {
+            return;
+        }
+        InventoryHolder holder = event.getInventory().getHolder();
+        if (holder instanceof BlockState || holder instanceof DoubleChest) {
+            final PlayerActiveInventoryModifications modifications = containersByOwner.get(player);
+            if (modifications != null) {
+                Inventory container = event.getView().getTopInventory();
+                int containerSize = container.getSize();
+                for (Entry<Integer, ItemStack> e : event.getNewItems().entrySet()) {
+                    int slot = e.getKey();
+                    if (slot < containerSize) {
+                        ItemStack old = container.getItem(slot);
+                        int oldAmount = (old == null || old.getType() == Material.AIR) ? 0 : old.getAmount();
+                        modifications.addModification(e.getValue(), e.getValue().getAmount() - oldAmount);
+                    }
+                }
+            }
+        }
+    }
+}

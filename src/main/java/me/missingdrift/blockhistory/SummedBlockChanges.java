@@ -1,0 +1,43 @@
+package me.missingdrift.blockhistory;
+
+import static me.missingdrift.blockhistory.util.MessagingUtil.prettyMaterial;
+
+import me.missingdrift.blockhistory.QueryParams.SummarizationMode;
+import me.missingdrift.blockhistory.util.MessagingUtil;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Objects;
+import net.md_5.bungee.api.chat.BaseComponent;
+import net.md_5.bungee.api.chat.TextComponent;
+import org.bukkit.Location;
+
+public class SummedBlockChanges implements LookupCacheElement {
+    private final int type;
+    private final int created, destroyed;
+    private final float spaceFactor;
+    private final Actor actor;
+
+    public SummedBlockChanges(ResultSet rs, QueryParams p, float spaceFactor) throws SQLException {
+        // Actor currently useless here as we don't yet output UUID in results anywhere
+        actor = p.sum == SummarizationMode.PLAYERS ? new Actor(rs) : null;
+        type = p.sum == SummarizationMode.TYPES ? rs.getInt("type") : 0;
+        created = rs.getInt("created");
+        destroyed = rs.getInt("destroyed");
+        this.spaceFactor = spaceFactor;
+    }
+
+    @Override
+    public Location getLocation() {
+        return null;
+    }
+
+    @Override
+    public BaseComponent[] getLogMessage(int entry) {
+        return MessagingUtil.formatSummarizedChanges(created, destroyed, actor != null ? new TextComponent(actor.getName()) : prettyMaterial(Objects.toString(MaterialConverter.getMaterial(type))), 10, 10, spaceFactor);
+    }
+
+    @Override
+    public int getNumChanges() {
+        return created + destroyed;
+    }
+}
